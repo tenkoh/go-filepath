@@ -65,3 +65,201 @@ func TestMakeBrotherPath(t *testing.T) {
 
 ### まとめ
 外部からどのような形式でパスが与えられるか予期できない場合、まずは`filepath.Clean`を適用することでパスの形式を一意に定めることができ、思わぬ動作を防ぐことができました。`filepath`パッケージの中には内部的に`Clean`を適用してから処理を始めるメソッドもありますので、各メソッドを深く理解している場合は使い分けるのがもちろん良いですが、最初のうちは渡されたパス文字列に対しまずは`Clean`ぐらいの意識でも良いのかな？と筆者は思います。（個人の意見です）
+
+
+## `os`と組み合わせて便利に使う
+この節は`filepath`活用に便利な`os`のメソッドを説明するものです。ご留意ください。
+
+### 問題設定
+前の章で触れたように`filepath`パッケージの大半のメソッドは、パスを純粋な文字列として扱うため、対象がファイルかディレクトリかで処理を分けることに課題がありました。そんな時に活躍するパッケージの一つが`os`さんです。例題を通じて実践してみましょう。
+
+次のようなテストケースをパスしてください。
+ディレクトリ構成
+```shell
+./
+main.go
+main_test.go
+```
+
+```go:main_test.go
+func TestGetType(t *testing.T) {
+	tests := []struct {
+		target string
+		want   string
+	}{
+		{"./", "dir"},
+		{"./main.go", "file"},
+	}
+	for _, tt := range tests {
+		got := GetType(tt.target)
+		if got != tt.want {
+			t.Errorf("want %s, got %s", tt.want, got)
+		}
+	}
+}
+
+```
+
+### 実践
+`os.Stat`を使うことで解決できます。あるいは`filepath`の中でも実際のファイル構成に基づいて処理を行う`WalkDir`などを用いても同じことが可能だとは思いますが、今回は割愛します。
+
+```go:main.go
+func GetType(path string) string {
+	info, _ := os.Stat(path)
+	if !info.IsDir() {
+		return "file"
+	}
+	return "dir"
+}
+```
+
+`os.Stat`はファイルやディレクトリが存在しない場合はエラーを返してくれるため、存在確認目的でも使える便利なメソッドです。`filepath`の様々なメソッドと組み合わせて使うことで、`filepath`をより使いこなせると考えます。
+
+
+## 応用編
+では最後に、上記２つの例と組み合わせて、強力な`filepath.WalkDir`の活用を行ってみます。
+
+### 問題設定
+あるディレクトリ`src`配下のディレクトリ・ファイル全てを、ツリー構造を保ったまま他のディレクトリにコピーしたいとします。各種OSのコマンドでも実現できますが、ここは`filepath`を使うことにします。なお今回も簡単のために、実際のファイル操作は行わず、作成するディレクトリ一覧、ファイル一覧を出力するだけにとどめます。ファイル操作まで行う例は、筆者のGithubに例がありますので、よろしければ参照ください。
+
+https://github.com/tenkoh/fop
+
+
+さて、問題設定の一例を図にするとこうなります。
+
+```shell:before
+(pwd)
+  |- workdir/
+      |- src/
+          |- foo/
+              |- fizz.txt
+          |- bar/
+```
+```shell:after
+(pwd)
+  |- workdir/
+      |- src/
+          |- foo/
+              |- fizz.txt
+          |- bar/
+      |- {name}/
+          |- foo/
+              |- fizz.txt
+          |- bar/
+```
+
+なおディレクトリパスではなく、ファイルパスが与えられることもあるとします。
+
+### 実装
+ディレクトリ以下の全てのファイル・ディレクトリを走査するのに`filepath.WalkDir`は便利です。使い方は最初ちょっと難しいですが、次のようなものです。
+
+```go
+err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+    if err!=nil{
+        // 走査中にエラーが生じた場合の処理を書く
+    }
+    // エラーなく走査できた時に、各ファイル・ディレクトリパスに対して行う処理を書く
+    // path: 走査中のパス。path = root/path1/path2 のような形式
+    // d: 走査対象のオブジェクト。IsDir()などのファイル情報を教えてくれるメソッドを持つ。
+})
+```
+
+先ほどの例で見たようにファイルかディレクトリかで処理を変えたい場合には、`d fs.DirEntry`オブジェクトを、先例における`os.Stat`の返り値と同じように扱うことができます。
+
+最初に注意するのは、やはりどのような形式でコピー元ディレクトリ or ファイルを与えられるかわからない点です。先程までの例を組み合わせて立ち向かいましょう…！
+
+```go:main.go
+// CopyTree returns files []string, dirs []string, error
+func CopyTree(path, name string) ([]string, []string, error) {
+	// なにはともあれClean
+	path = filepath.Clean(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 与えられたのがファイルパスだったら、{name}/ファイル名を返しておわり
+	if !info.IsDir() {
+		f := filepath.Join(name, filepath.Base(path))
+		return []string{f}, nil, nil
+	}
+
+	// 与えられたのがディレクトリだったら順々に走査する
+	files, dirs := []string{}, []string{}
+	err = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// pathをrootとする相対位置を求めて{name}に結合する
+		rel, err := filepath.Rel(path, p)
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(name, rel)
+
+        // 対象がファイルのとき
+		if !d.IsDir() {
+			files = append(files, dst)
+			return nil
+		}
+
+        // 対象がディレクトリの時
+		dirs = append(dirs, dst)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return files, dirs, nil
+}
+```
+
+なかなか長くなってしまいましたができました。この関数は次のテストをパスします。長いのでエラー処理や、期待値との比較部分については省略しています。完全なテスト例は[Githubリポジトリ](https://github.com/tenkoh/go-filepath)でご確認ください。
+
+```go:main_test.go
+func TestMain(m *testing.M) {
+	testDirs := []string{"workdir/src/foo", "workdir/src/bar"}
+	for _, dir := range testDirs {
+		os.MkdirAll(filepath.Clean(dir), 0755); err != nil {
+	}
+	defer os.RemoveAll("workdir")
+
+	f, _ := os.Create(filepath.Clean("workdir/src/foo/fizz.txt"))
+	f.Close()
+
+	m.Run()
+}
+
+func TestCopyTree(t *testing.T) {
+	dst := "workdir/dst"
+	tests := []struct {
+		src       string
+		wantFiles []string
+		wantDirs  []string
+	}{
+		{
+			"workdir/src",
+			[]string{"workdir/dst/foo/fizz.txt"},
+			[]string{"workdir/dst", "workdir/dst/bar", "workdir/dst/foo"},
+		},
+	}
+	for _, tt := range tests {
+		fs, ds, _ := CopyTree(tt.src, dst)
+
+		// replace slash to OS's separator
+		wfs, wds := []string{}, []string{}
+		for _, f := range tt.wantFiles {
+			wfs = append(wfs, filepath.FromSlash(f))
+		}
+		for _, d := range tt.wantDirs {
+			wds = append(wds, filepath.FromSlash(d))
+		}
+
+		// 長いので省略: compare fs with wfs
+        // 長いので省略: compare ds with wds
+	}
+}
+
+```
+
+## おわりに
+いくつかの例を通して`path/filepath`を使ってみました。特にテストを書く際に意識して頂くと分かるのですが、返ってくるパスがどのような形式になるかは、慣れるまではなかなか予測しづらいです。その際はぜひ前章に記載した分類を思い出してみてください。
